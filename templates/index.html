@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux Log Timeline</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+  h1 { margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 14px; margin-bottom: 20px; }
+  .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .stat { background: #1e293b; border-radius: 12px; padding: 12px; border-top: 4px solid #334155; }
+  .stat .n { font-size: 26px; font-weight: 700; }
+  .stat .l { color: #94a3b8; font-size: 13px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+  .controls label { font-size: 14px; cursor: pointer; user-select: none; }
+  select { background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }
+  .chartbox { height: 320px; position: relative; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #334155; font-size: 13px; vertical-align: top; }
+  th { color: #94a3b8; }
+  .badge { padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #0f172a; font-weight: 600; white-space: nowrap; }
+  .msg { word-break: break-word; }
+  .scroll { max-height: 420px; overflow-y: auto; }
+  #alert { display: none; background: #7f1d1d; border: 1px solid #ef4444; color: #fecaca;
+           border-radius: 12px; padding: 14px 16px; margin-bottom: 16px; font-size: 14px; }
+  #alert b { color: #fff; }
+</style>
+</head>
+<body>
+  <h1>Linux Log Timeline</h1>
+  <div class="sub" id="sub">Loading...</div>
+
+  <div id="alert"></div>
+  <div class="stats" id="stats"></div>
+
+  <div class="card controls">
+    <div>
+      Time range:
+      <select id="range" autocomplete="off">
+        <option value="1h">Last 1 hour</option>
+        <option value="6h">Last 6 hours</option>
+        <option value="24h" selected>Last 24 hours</option>
+        <option value="7d">Last 7 days</option>
+      </select>
+    </div>
+    <div id="filters"></div>
+  </div>
+
+  <div class="card">
+    <div class="chartbox"><canvas id="timeline"></canvas></div>
+  </div>
+
+  <div class="card">
+    <div style="color:#94a3b8;margin-bottom:8px" id="tabletitle">Events</div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Type</th><th>Source</th><th>Message</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+const TYPES = {
+  crash:        { color: "#ef4444", label: "Crash" },
+  service_failed: { color: "#fb7185", label: "Service failure" },
+  sudo: { color: "#14b8a6", label: "Sudo / admin" },
+  error:        { color: "#f97316", label: "Error" },
+  failed_login: { color: "#a855f7", label: "Failed login" },
+  login:        { color: "#22c55e", label: "Login" },
+  logout:       { color: "#64748b", label: "Logout" },
+  boot:         { color: "#38bdf8", label: "Boot" },
+  warning:      { color: "#eab308", label: "Warning" },
+};
+const RANGE_MS = { "1h": 3600e3, "6h": 6 * 3600e3, "24h": 24 * 3600e3, "7d": 7 * 24 * 3600e3 };
+const BUCKET_MS = { "1h": 60e3, "6h": 5 * 60e3, "24h": 15 * 60e3, "7d": 3600e3 };
+
+let allEvents = [];
+let currentRange = "24h";
+let chart = null;
+// Warnings bohat zyada hote hain, isliye default mein band
+const active = new Set(["crash", "service_failed", "sudo", "error", "failed_login", "login", "logout", "boot"]);
+
+function buildFilters() {
+  const box = document.getElementById("filters");
+  box.innerHTML = "";
+  Object.keys(TYPES).forEach(t => {
+    const label = document.createElement("label");
+    label.style.marginRight = "14px";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = active.has(t);
+    cb.addEventListener("change", () => {
+      cb.checked ? active.add(t) : active.delete(t);
+      render();
+    });
+    const dot = document.createElement("span");
+    dot.textContent = " ● ";
+    dot.style.color = TYPES[t].color;
+    label.append(cb, dot, TYPES[t].label);
+    box.appendChild(label);
+  });
+}
+
+function renderAlerts(alerts) {
+  const box = document.getElementById("alert");
+  box.innerHTML = "";
+  if (!alerts.length) { box.style.display = "none"; return; }
+  box.style.display = "block";
+  alerts.forEach(a => {
+    const line = document.createElement("div");
+    const t1 = new Date(a.start).toLocaleTimeString();
+    const t2 = new Date(a.end).toLocaleTimeString();
+    const b = document.createElement("b");
+    b.textContent = "Suspicious activity: ";
+    line.append(b, a.count + " failed login attempts between " + t1 + " and " + t2);
+    box.appendChild(line);
+  });
+}
+
+async function load() {
+  document.getElementById("sub").textContent = "Loading logs...";
+  try {
+    const r = await fetch("/api/events?range=" + currentRange);
+    const data = await r.json();
+    allEvents = data.events;
+    renderAlerts(data.alerts || []);
+    document.getElementById("sub").textContent =
+      data.total + " events found in the selected range (journalctl)";
+    render();
+  } catch (e) {
+    document.getElementById("sub").textContent = "Unable to load logs.";
+  }
+}
+
+function renderStats() {
+  const box = document.getElementById("stats");
+  box.innerHTML = "";
+  const counts = {};
+  allEvents.forEach(e => counts[e.type] = (counts[e.type] || 0) + 1);
+  Object.keys(TYPES).forEach(t => {
+    const d = document.createElement("div");
+    d.className = "stat";
+    d.style.borderTopColor = TYPES[t].color;
+    const n = document.createElement("div");
+    n.className = "n";
+    n.textContent = counts[t] || 0;
+    const l = document.createElement("div");
+    l.className = "l";
+    l.textContent = TYPES[t].label;
+    d.append(n, l);
+    box.appendChild(d);
+  });
+}
+
+function renderChart(filtered) {
+  const size = BUCKET_MS[currentRange];
+  const end = Date.now();
+  const start = Math.floor((end - RANGE_MS[currentRange]) / size) * size;
+  const n = Math.ceil((end - start) / size) + 1;
+  const labels = [];
+  for (let i = 0; i < n; i++) {
+    const d = new Date(start + i * size);
+    labels.push(currentRange === "7d"
+      ? d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" })
+      : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+  }
+  const datasets = Object.keys(TYPES).filter(t => active.has(t)).map(t => {
+    const data = new Array(n).fill(0);
+    filtered.filter(e => e.type === t).forEach(e => {
+      const idx = Math.floor((new Date(e.time).getTime() - start) / size);
+      if (idx >= 0 && idx < n) data[idx]++;
+    });
+    return { label: TYPES[t].label, data, backgroundColor: TYPES[t].color };
+  });
+  if (chart) chart.destroy();
+  chart = new Chart(document.getElementById("timeline"), {
+    type: "bar",
+    data: { labels, datasets },
+    options: {
+      animation: false,
+      maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true, ticks: { color: "#94a3b8", maxTicksLimit: 12 }, grid: { display: false } },
+        y: { stacked: true, beginAtZero: true, ticks: { color: "#94a3b8", precision: 0 }, grid: { color: "#334155" } },
+      },
+      plugins: { legend: { labels: { color: "#e2e8f0" } } },
+    },
+  });
+}
+
+function renderTable(filtered) {
+  const rows = document.getElementById("rows");
+  rows.innerHTML = "";
+  const list = filtered.slice().reverse().slice(0, 300);
+  document.getElementById("tabletitle").textContent =
+    "Events (newest first, showing " + list.length + " of " + filtered.length + ")";
+  list.forEach(e => {
+    const tr = document.createElement("tr");
+    const time = document.createElement("td");
+    time.textContent = e.time.replace("T", " ");
+    const typ = document.createElement("td");
+    const b = document.createElement("span");
+    b.className = "badge";
+    b.style.background = TYPES[e.type] ? TYPES[e.type].color : "#94a3b8";
+    b.textContent = TYPES[e.type] ? TYPES[e.type].label : e.type;
+    typ.appendChild(b);
+    const src = document.createElement("td");
+    src.textContent = e.source;
+    const msg = document.createElement("td");
+    msg.className = "msg";
+    msg.textContent = e.message;
+    tr.append(time, typ, src, msg);
+    rows.appendChild(tr);
+  });
+}
+
+function render() {
+  const filtered = allEvents.filter(e => active.has(e.type));
+  renderStats();
+  renderChart(filtered);
+  renderTable(filtered);
+}
+
+document.getElementById("range").addEventListener("change", ev => {
+  currentRange = ev.target.value;
+  load();
+});
+
+buildFilters();
+load();
+</script>
+</body>
+</html>
